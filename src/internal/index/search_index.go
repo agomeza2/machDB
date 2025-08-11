@@ -41,27 +41,26 @@ func NewIndex() *Index {
 		basePath:  basePath,
 	}
 }
-
-func (ref ObjectRef) GetObject(idx *Index) (*db.Object, error) {
+func (idx *Index) GetDocumentContent(dbName, colName, docName string) (*db.Document, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	db, ok := idx.Databases[ref.DB]
+	database, ok := idx.Databases[dbName]
 	if !ok {
-		return nil, fmt.Errorf("db no encontrada")
+		return nil, fmt.Errorf("database %s no encontrada", dbName)
 	}
-	col, ok := db.Collections[ref.Collection]
+
+	collection, ok := database.Collections[colName]
 	if !ok {
-		return nil, fmt.Errorf("collection no encontrada")
+		return nil, fmt.Errorf("colección %s no encontrada en database %s", colName, dbName)
 	}
-	doc, ok := col.Documents[ref.Document]
+
+	document, ok := collection.Documents[docName]
 	if !ok {
-		return nil, fmt.Errorf("documento no encontrado")
+		return nil, fmt.Errorf("documento %s no encontrado en colección %s", docName, colName)
 	}
-	if ref.ID < 0 || ref.ID >= len(doc.Objects) {
-		return nil, fmt.Errorf("ID de objeto fuera de rango")
-	}
-	return doc.Objects[ref.ID], nil
+
+	return document, nil
 }
 
 // CreateDatabase crea una DB en memoria usando tu struct Database
@@ -195,15 +194,276 @@ func (idx *Index) Find(field, value string, dbName string, collections ...string
 func (idx *Index) FindByQuery(query string, db string, collections ...string) ([]*db.Object, error) {
 	parts := strings.SplitN(query, ":", 2)
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("query mal formada, debe ser campo:valor")
+		return nil, fmt.Errorf("bad query format")
 	}
 	field := parts[0]
 	value := parts[1]
 	return idx.Find(field, value, db, collections...)
 }
+func (idx *Index) test() {
+	fmt.Println("Test method called")
+}
 
-// FlushToDisk: recorre idx.Databases y escribe en disco (carpetas + archivos JSON)
-// Hace mkdir -p basePath/dbName/collectionName y guarda cada documento como JSON <doc>.json
+func (idx *Index) ListDatabases() []string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	dbNames := make([]string, 0, len(idx.Databases))
+	for name := range idx.Databases {
+		dbNames = append(dbNames, name)
+	}
+	return dbNames
+}
+func (idx *Index) ListCollections(dbName string) ([]string, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	database, ok := idx.Databases[dbName]
+	if !ok {
+		return nil, fmt.Errorf("database %s no encontrada", dbName)
+	}
+
+	collections := make([]string, 0, len(database.Collections))
+	for colName := range database.Collections {
+		collections = append(collections, colName)
+	}
+
+	return collections, nil
+}
+func (idx *Index) ListDocuments(dbName, colName string) ([]string, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	database, ok := idx.Databases[dbName]
+	if !ok {
+		return nil, fmt.Errorf("database %s no encontrada", dbName)
+	}
+
+	collection, err := database.GetCollection(colName)
+	if err != nil {
+		return nil, err
+	}
+
+	documents := make([]string, 0, len(collection.Documents))
+	for docName := range collection.Documents {
+		documents = append(documents, docName)
+	}
+
+	return documents, nil
+}
+
+// DeleteDatabase elimina una base de datos completa y sus referencias en el índice.
+func (idx *Index) DeleteDatabase(dbName string) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	_, ok := idx.Databases[dbName]
+	if !ok {
+		return fmt.Errorf("database %s not found", dbName)
+	}
+
+	// Eliminar referencias del índice invertido relacionadas con esta DB
+	for field, valMap := range idx.Index {
+		for val, refs := range valMap {
+			newRefs := refs[:0]
+			for _, ref := range refs {
+				if ref.DB != dbName {
+					newRefs = append(newRefs, ref)
+				}
+			}
+			if len(newRefs) == 0 {
+				delete(valMap, val)
+			} else {
+				valMap[val] = newRefs
+			}
+		}
+		if len(valMap) == 0 {
+			delete(idx.Index, field)
+		}
+	}
+
+	// Finalmente eliminar la base de datos
+	delete(idx.Databases, dbName)
+	return nil
+}
+
+// DeleteCollection elimina una colección y sus referencias en el índice dentro de una base de datos.
+func (idx *Index) DeleteCollection(dbName, colName string) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	database, ok := idx.Databases[dbName]
+	if !ok {
+		return fmt.Errorf("database %s no encontrada", dbName)
+	}
+
+	_, ok = database.Collections[colName]
+	if !ok {
+		return fmt.Errorf("colección %s no encontrada en database %s", colName, dbName)
+	}
+
+	// Eliminar referencias en el índice invertido de esta colección
+	for field, valMap := range idx.Index {
+		for val, refs := range valMap {
+			newRefs := refs[:0]
+			for _, ref := range refs {
+				if !(ref.DB == dbName && ref.Collection == colName) {
+					newRefs = append(newRefs, ref)
+				}
+			}
+			if len(newRefs) == 0 {
+				delete(valMap, val)
+			} else {
+				valMap[val] = newRefs
+			}
+		}
+		if len(valMap) == 0 {
+			delete(idx.Index, field)
+		}
+	}
+
+	// Eliminar colección
+	delete(database.Collections, colName)
+	return nil
+}
+
+// DeleteDocument elimina un documento y sus referencias en el índice dentro de una colección y base de datos.
+func (idx *Index) DeleteDocument(dbName, colName, docName string) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	database, ok := idx.Databases[dbName]
+	if !ok {
+		return fmt.Errorf("database %s no encontrada", dbName)
+	}
+
+	collection, ok := database.Collections[colName]
+	if !ok {
+		return fmt.Errorf("colección %s no encontrada en database %s", colName, dbName)
+	}
+
+	doc, ok := collection.Documents[docName]
+	if !ok {
+		return fmt.Errorf("documento %s no encontrado en colección %s", docName, colName)
+	}
+
+	// Eliminar referencias en el índice invertido para cada objeto del documento
+	for oid, obj := range doc.Objects {
+		for field, value := range obj.Fields {
+			valStr := fmt.Sprintf("%v", value)
+			if valMap, ok := idx.Index[field]; ok {
+				if refs, ok := valMap[valStr]; ok {
+					newRefs := refs[:0]
+					for _, ref := range refs {
+						if !(ref.DB == dbName && ref.Collection == colName && ref.Document == docName && ref.ID == oid) {
+							newRefs = append(newRefs, ref)
+						}
+					}
+					if len(newRefs) == 0 {
+						delete(valMap, valStr)
+					} else {
+						valMap[valStr] = newRefs
+					}
+				}
+				if len(valMap) == 0 {
+					delete(idx.Index, field)
+				}
+			}
+		}
+	}
+
+	// Eliminar documento
+	delete(collection.Documents, docName)
+	return nil
+}
+
+func (idx *Index) LoadFromDisk() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	// Limpiar estructura actual
+	idx.Databases = make(map[string]*db.Database)
+	idx.Index = make(InvertedIndex)
+
+	// Leer directorio base (idx.basePath), por ejemplo "/db"
+	dbEntries, err := os.ReadDir(idx.basePath)
+	if err != nil {
+		return err
+	}
+
+	for _, dbEntry := range dbEntries {
+		if !dbEntry.IsDir() {
+			continue
+		}
+		dbName := dbEntry.Name()
+		database := db.NewDatabase(dbName)
+		dbPath := filepath.Join(idx.basePath, dbName)
+
+		colEntries, err := os.ReadDir(dbPath)
+		if err != nil {
+			return err
+		}
+
+		for _, colEntry := range colEntries {
+			if !colEntry.IsDir() {
+				continue
+			}
+			colName := colEntry.Name()
+			if err := database.CreateCollection(colName); err != nil {
+				return err
+			}
+			collection, err := database.GetCollection(colName)
+			if err != nil {
+				return err
+			}
+
+			colPath := filepath.Join(dbPath, colName)
+			docEntries, err := os.ReadDir(colPath)
+			if err != nil {
+				return err
+			}
+
+			for _, docEntry := range docEntries {
+				if docEntry.IsDir() || !strings.HasSuffix(docEntry.Name(), ".json") {
+					continue
+				}
+				docName := strings.TrimSuffix(docEntry.Name(), ".json")
+				docPath := filepath.Join(colPath, docEntry.Name())
+
+				f, err := os.Open(docPath)
+				if err != nil {
+					return err
+				}
+
+				var doc db.Document
+				dec := json.NewDecoder(f)
+				if err := dec.Decode(&doc); err != nil {
+					f.Close()
+					return err
+				}
+				f.Close()
+
+				collection.Documents[docName] = &doc
+
+				// Reconstruir índice invertido para cada objeto del documento
+				for oid, obj := range doc.Objects {
+					for k, v := range obj.Fields {
+						valStr := fmt.Sprintf("%v", v)
+						if _, ok := idx.Index[k]; !ok {
+							idx.Index[k] = make(map[string][]ObjectRef)
+						}
+						ref := ObjectRef{DB: dbName, Collection: colName, Document: docName, ID: oid}
+						idx.Index[k][valStr] = append(idx.Index[k][valStr], ref)
+					}
+				}
+			}
+		}
+
+		idx.Databases[dbName] = database
+	}
+
+	return nil
+}
 func (idx *Index) FlushToDisk() error {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()

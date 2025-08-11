@@ -11,8 +11,11 @@ import (
 
 func main() {
 	fmt.Println("Interpreter DB CLI")
-	inter := query.NewInterpreter("./data")
-
+	inter, err := query.NewInterpreter("/db")
+	if err != nil {
+		fmt.Println("Error initializing interpreter:", err)
+		return
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
@@ -25,6 +28,9 @@ func main() {
 			continue
 		}
 		if strings.ToLower(line) == "exit" {
+			inter.Save()
+			fmt.Println("Saving changes to disk...")
+			fmt.Println("bye, see you later.")
 			break
 		}
 
