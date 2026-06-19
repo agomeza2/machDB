@@ -5,8 +5,8 @@ import "fmt"
 // Document → un documento JSON que contiene múltiples objetos
 type Document struct {
 	Name      string
-	Objects   []*Object `json:"objects"`
-	nextObjID int       `json:"-"`
+	Objects   []*Object `bson:"objects"`
+	nextObjID int       `bson:"-"`
 }
 
 func NewDocument(name string) *Document {
